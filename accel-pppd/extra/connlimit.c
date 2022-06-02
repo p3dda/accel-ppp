@@ -3,13 +3,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include <net/ethernet.h>
 
+#include "cli.h"
+#include "connlimit.h"
 #include "ppp.h"
 #include "events.h"
 #include "triton.h"
 #include "log.h"
-
 #include "memdebug.h"
+#include "utils.h"
 
 struct item
 {
@@ -103,6 +106,85 @@ int __export connlimit_check(uint64_t key)
 	return r;
 }
 
+static void connlimit_flush(void) {
+	struct item *it;
+	pthread_mutex_lock(&lock);
+	while (!list_empty(&items)) {
+		it = list_entry(items.next, typeof(*it), entry);
+		list_del(&it->entry);
+		_free(it);
+	}
+	pthread_mutex_unlock(&lock);
+	log_debug("connlimit: remove all entries\n");
+}
+
+static void connlimit_flush_key(uint64_t key) {
+	struct item *it;
+	struct list_head *pos, *n;
+
+	pthread_mutex_lock(&lock);
+
+	list_for_each_safe(pos, n, &items) {
+		it = list_entry(pos, typeof(*it), entry);
+		if (it->key == key) {
+			log_debug("connlimit: remove %" PRIu64 "\n", it->key);
+			list_del(&it->entry);
+			_free(it);
+			break;
+		}
+	}
+	pthread_mutex_unlock(&lock);
+}
+
+static void connlimit_flush_mac(const char *addr, void *client) {
+	uint8_t a[ETH_ALEN];
+
+	if (sscanf(addr, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx", &a[0], &a[1], &a[2], &a[3], &a[4], &a[5]) != 6) {
+		cli_send(client, "invalid format\r\n");
+		return;
+	}
+	connlimit_flush_key(cl_key_from_mac(a));
+}
+
+static void connlimit_flush_ip(const char *addr, void *client) {
+	struct in_addr ip_addr;
+	size_t len;
+	len = u_parse_ip4addr(addr, &ip_addr);
+	if (!len) {
+		cli_send(client, "invalid format\r\n");
+		return;
+	}
+	connlimit_flush_key(cl_key_from_ipv4(ip_addr.s_addr));
+}
+
+static void cmd_help(char * const *fields, int fields_cnt, void *client)
+{
+	cli_send(client, "connlimit flush - flush connection limit entries\r\n");
+	cli_send(client, "\tip <addresss> - flush by ip address\r\n");
+	cli_send(client, "\tmac <mac> - flush by station mac address\r\n");
+	cli_send(client, "\tall - flush all entries\r\n");
+}
+
+static int cmd_exec(const char *cmd, char * const *fields, int fields_cnt, void *client) {
+	if (fields_cnt < 3)
+		goto help;
+	if (strcmp(fields[1], "flush"))
+		goto help;
+	if (!strcmp(fields[2], "all")) {
+		connlimit_flush();
+	} else if (fields_cnt == 4 && !strcmp(fields[2], "mac")) {
+		connlimit_flush_mac(fields[3], client);
+	} else if (fields_cnt == 4 && !strcmp(fields[2], "ip")) {
+		connlimit_flush_ip(fields[3], client);
+	} else
+		goto help;
+
+	return CLI_CMD_OK;
+	help:
+	cmd_help(fields, fields_cnt, client);
+	return CLI_CMD_OK;
+}
+
 static int parse_limit(const char *opt, int *limit, int *time)
 {
 	char *endptr;
@@ -162,11 +244,13 @@ static void load_config()
 		conf_burst_timeout = atoi(opt) * 1000;
 }
 
+
 static void init()
 {
 	load_config();
 
 	triton_event_register_handler(EV_CONFIG_RELOAD, (triton_event_func)load_config);
+	cli_register_simple_cmd2(cmd_exec, cmd_help, 1, "connlimit");
 }
 
 DEFINE_INIT(200, init);
