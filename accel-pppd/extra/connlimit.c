@@ -4,6 +4,7 @@
 #include <string.h>
 #include <pthread.h>
 #include <net/ethernet.h>
+#include <arpa/inet.h>
 
 #include "cli.h"
 #include "connlimit.h"
@@ -106,6 +107,54 @@ int __export connlimit_check(uint64_t key)
 	return r;
 }
 
+static void fmt_age(struct timespec ts, char *buf, char *buf_raw) {
+	time_t uptime;
+	int day, hour, min, sec;
+	char time_str[24];
+
+	uptime = _time() - ts.tv_sec;
+
+	hour = uptime / (60 * 60);
+	uptime %= (60 * 60);
+	min = uptime / 60;
+	sec = uptime % 60;
+
+	snprintf(time_str, sizeof(time_str), "%02i:%02i:%02i", hour, min, sec);
+
+	sprintf(buf, "%s", time_str);
+	sprintf(buf_raw,"%lu", (unsigned long)uptime);
+}
+
+static void connlimit_show(void *client) {
+	struct item *it;
+	struct list_head *pos, *n;
+	char buf[129], ip[16], age[24], age_raw[12];
+
+	union {
+		__u8 mac[ETH_ALEN];
+		__u64 mac_u;
+	} mac;
+
+	cli_send(client, "       mac         |       ip      | count |    age   | age-raw   \r\n");
+	cli_send(client, "-------------------+---------------+-------+----------+-----------\r\n");
+
+	pthread_mutex_lock(&lock);
+	list_for_each_safe(pos, n, &items) {
+ 		it = list_entry(pos, typeof(*it), entry);
+		if (it->key > UINT32_MAX) {
+			mac.mac_u = it->key;
+			sprintf(buf, " %02x:%02x:%02x:%02x:%02x:%02x | %-12s ", mac.mac[0], mac.mac[1], mac.mac[2], mac.mac[3], mac.mac[4], mac.mac[5], " ");
+		} else {
+			u_inet_ntoa(it->key, ip);
+			sprintf(buf, " %-18s| %-13s", " ", ip);
+		}
+		fmt_age(it->ts, age, age_raw);
+		cli_sendv(client, "%s | %-5d | %-8s | %s \r\n", buf, it->count, age, age_raw);
+	}
+
+	pthread_mutex_unlock(&lock);
+}
+
 static void connlimit_flush(void) {
 	struct item *it;
 	pthread_mutex_lock(&lock);
@@ -159,6 +208,7 @@ static void connlimit_flush_ip(const char *addr, void *client) {
 
 static void cmd_help(char * const *fields, int fields_cnt, void *client)
 {
+	cli_send(client, "connlimit show - show connection limit entries\r\n");
 	cli_send(client, "connlimit flush - flush connection limit entries\r\n");
 	cli_send(client, "\tip <addresss> - flush by ip address\r\n");
 	cli_send(client, "\tmac <mac> - flush by station mac address\r\n");
@@ -166,16 +216,19 @@ static void cmd_help(char * const *fields, int fields_cnt, void *client)
 }
 
 static int cmd_exec(const char *cmd, char * const *fields, int fields_cnt, void *client) {
-	if (fields_cnt < 3)
+	if (fields_cnt < 2)
 		goto help;
-	if (strcmp(fields[1], "flush"))
-		goto help;
-	if (!strcmp(fields[2], "all")) {
-		connlimit_flush();
-	} else if (fields_cnt == 4 && !strcmp(fields[2], "mac")) {
-		connlimit_flush_mac(fields[3], client);
-	} else if (fields_cnt == 4 && !strcmp(fields[2], "ip")) {
-		connlimit_flush_ip(fields[3], client);
+	if (!strcmp(fields[1], "flush")) {
+		if (fields_cnt == 3 && !strcmp(fields[2], "all")) {
+			connlimit_flush();
+		} else if (fields_cnt == 4 && !strcmp(fields[2], "mac")) {
+			connlimit_flush_mac(fields[3], client);
+		} else if (fields_cnt == 4 && !strcmp(fields[2], "ip")) {
+			connlimit_flush_ip(fields[3], client);
+		} else
+			goto help;
+	} else if (fields_cnt == 2 && !strcmp(fields[1], "show")) {
+		connlimit_show(client);
 	} else
 		goto help;
 
